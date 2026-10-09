@@ -73,60 +73,125 @@ def order_points(points):
     return ordered
 
 
-def create_white_mask(img):
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+A3_ASPECT = A3_WIDTH_MM / A3_HEIGHT_MM
+MIN_PAPER_AREA_FRAC = 0.08
+MAX_PAPER_AREA_FRAC = 0.90
+MIN_RECTANGULARITY = 0.85
+MAX_ASPECT_ERROR = 0.30
+
+
+def create_white_masks(img):
+    """Yield several 'paper-like' masks so one lighting change cannot break detection.
+
+    Thresholds are derived from the image itself (Otsu / percentiles) instead of
+    being fixed, and a few variants are tried; the best-scoring one wins later.
+    """
+    blurred = cv2.GaussianBlur(img, (5, 5), 0)
+    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
     _, saturation, value = cv2.split(hsv)
 
-    mask = np.zeros(img.shape[:2], dtype=np.uint8)
-    mask[(saturation < 70) & (value > 170)] = 255
+    otsu_value, _ = cv2.threshold(value, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    bright_ref = float(np.percentile(value, 98))
+    max_sat = max(60.0, float(np.percentile(saturation[value > otsu_value], 75)) + 25.0) \
+        if np.any(value > otsu_value) else 70.0
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 21))
-    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    value_thresholds = {
+        otsu_value,
+        0.85 * otsu_value,
+        0.60 * bright_ref,
+        0.75 * bright_ref,
+        170,
+    }
+
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 21))
+
+    for threshold in sorted(value_thresholds):
+        mask = ((value > threshold) & (saturation < max_sat)).astype(np.uint8) * 255
+        # Opening cuts thin bridges (e.g. paper touching a bright rail),
+        # closing fills the shapes sitting on the paper.
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel)
+        yield cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=2)
 
 
-def find_a3_corners(img):
-    white_mask = create_white_mask(img)
-    contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+def fit_quad(contour):
+    hull = cv2.convexHull(contour)
+    perimeter = cv2.arcLength(hull, True)
 
-    if not contours:
-        return None
-
-    image_h, image_w = img.shape[:2]
-    image_area = float(image_h * image_w)
-    candidates = []
-
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < 0.10 * image_area:
-            continue
-
-        x, y, w, h = cv2.boundingRect(cnt)
-        spans_full_width = (x <= 2 and (x + w) >= image_w - 2)
-        spans_full_height = (y <= 2 and (y + h) >= image_h - 2)
-
-        if spans_full_width or spans_full_height:
-            continue
-
-        candidates.append(cnt)
-
-    if not candidates:
-        return None
-
-    paper_contour = max(candidates, key=cv2.contourArea)
-    perimeter = cv2.arcLength(paper_contour, True)
-    paper_quad = None
-
-    for epsilon_factor in (0.020, 0.025, 0.030, 0.035, 0.040, 0.050):
-        approx = cv2.approxPolyDP(paper_contour, epsilon_factor * perimeter, True)
+    for epsilon_factor in (0.010, 0.015, 0.020, 0.025, 0.030, 0.040, 0.050):
+        approx = cv2.approxPolyDP(hull, epsilon_factor * perimeter, True)
         if len(approx) == 4:
-            paper_quad = approx.reshape(4, 2).astype(np.float32)
-            break
+            return approx.reshape(4, 2).astype(np.float32)
 
-    if paper_quad is None:
-        rect = cv2.minAreaRect(paper_contour)
-        paper_quad = cv2.boxPoints(rect).astype(np.float32)
+    return cv2.boxPoints(cv2.minAreaRect(hull)).astype(np.float32)
 
-    return order_points(paper_quad)
+
+def score_paper_quad(quad, contour, image_shape):
+    """Return a 0..1 score of how much a contour looks like an A3 sheet, or 0."""
+    image_h, image_w = image_shape[:2]
+    image_area = float(image_h * image_w)
+
+    quad_area = cv2.contourArea(quad)
+    if quad_area <= 0:
+        return 0.0
+
+    area_frac = quad_area / image_area
+    if not (MIN_PAPER_AREA_FRAC <= area_frac <= MAX_PAPER_AREA_FRAC):
+        return 0.0
+
+    if not cv2.isContourConvex(quad.astype(np.int32)):
+        return 0.0
+
+    rectangularity = min(cv2.contourArea(contour) / quad_area, 1.0)
+    if rectangularity < MIN_RECTANGULARITY:
+        return 0.0
+
+    ordered = order_points(quad)
+    side_top = np.linalg.norm(ordered[1] - ordered[0])
+    side_bottom = np.linalg.norm(ordered[2] - ordered[3])
+    side_left = np.linalg.norm(ordered[3] - ordered[0])
+    side_right = np.linalg.norm(ordered[2] - ordered[1])
+    long_side = (side_top + side_bottom) / 2.0
+    short_side = (side_left + side_right) / 2.0
+    if min(long_side, short_side) <= 0:
+        return 0.0
+
+    # Orientation independent; tolerant to perspective.
+    aspect = max(long_side, short_side) / min(long_side, short_side)
+    aspect_error = abs(aspect - A3_ASPECT) / A3_ASPECT
+    if aspect_error > MAX_ASPECT_ERROR:
+        return 0.0
+
+    # Paper that is cut off by the image border cannot be rectified correctly.
+    margin = 3
+    if (quad[:, 0].min() < -margin or quad[:, 1].min() < -margin
+            or quad[:, 0].max() > image_w + margin or quad[:, 1].max() > image_h + margin):
+        return 0.0
+
+    return rectangularity * (1.0 - aspect_error) * (0.5 + 0.5 * area_frac)
+
+
+def find_a3_corners(img, debug=False):
+    best_score = 0.0
+    best_quad = None
+
+    for white_mask in create_white_masks(img):
+        contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        for cnt in contours:
+            if cv2.contourArea(cnt) < MIN_PAPER_AREA_FRAC * img.shape[0] * img.shape[1]:
+                continue
+
+            quad = fit_quad(cnt)
+            score = score_paper_quad(quad, cnt, img.shape)
+            if score > best_score:
+                best_score, best_quad = score, quad
+
+    if best_quad is None:
+        return (None, 0.0) if debug else None
+
+    corners = order_points(best_quad)
+    return (corners, best_score) if debug else corners
 
 
 def rectify_a3(img, corners):
