@@ -13,7 +13,7 @@ from ultralytics import YOLO
 # CONFIGURATION
 # ============================================================
 
-EXPOSURE_TIME = 20000.0
+EXPOSURE_TIME = 25000.0
 
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "models" / "best.pt"
@@ -28,7 +28,7 @@ MAX_OBJECT_MM = 70.0
 MIN_CONTOUR_AREA_PX = 1500
 WORK_MARGIN_MM = 5.0
 
-CONFIDENCE_THRESHOLD = 0.3
+CONFIDENCE_THRESHOLD = 0.9
 REJECT_CLASS = "other"
 
 
@@ -202,11 +202,11 @@ def find_object_candidates(rectified_img):
         short_mm = min(w_mm, h_mm)
         long_mm = max(w_mm, h_mm)
 
-        # if not (
-        #     MIN_OBJECT_MM <= short_mm <= MAX_OBJECT_MM
-        #     and MIN_OBJECT_MM <= long_mm <= MAX_OBJECT_MM
-        # ):
-        #     continue
+        if not (
+            MIN_OBJECT_MM <= short_mm <= MAX_OBJECT_MM
+            and MIN_OBJECT_MM <= long_mm <= MAX_OBJECT_MM
+        ):
+            continue
 
         raw_x_mm = cx / PX_PER_MM
         raw_y_mm = cy / PX_PER_MM
