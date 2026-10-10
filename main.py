@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import shutil
 import time
 from pathlib import Path
@@ -14,6 +15,10 @@ from ultralytics import YOLO
 # ============================================================
 
 EXPOSURE_TIME = 25000.0
+
+# Upper limit on processed frames per second, to keep low-resource devices cool.
+MAX_FPS = 3.0
+WINDOW_NAME = "Detection (ESC / q to quit)"
 
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "models" / "best.pt"
@@ -325,24 +330,16 @@ def classify_objects(model, rectified_img, candidates):
     accepted_objects = []
     total_ai_time = 0.0
 
-    print(f"\n--- Found {len(candidates)} candidate shapes in mask ---")
-
-    for idx, obj in enumerate(candidates, start=1):
+    for obj in candidates:
         crop = crop_candidate(rectified_img, obj["contour"], padding_px=20)
-        
-        # Save crops to inspect what the model sees
-        cv2.imwrite(str(OUTPUT_DIR / f"crop_{idx}.png"), crop)
 
         class_name, confidence, ai_time = classify_crop(model, crop)
         total_ai_time += ai_time
-
-        print(f"Candidate {idx}: Predicted='{class_name}', Conf={confidence:.3f}, Size={obj['size_mm'][0]:.1f}x{obj['size_mm'][1]:.1f}mm")
 
         if class_name is None or class_name.strip().lower() == REJECT_CLASS.lower():
             continue
 
         if confidence < CONFIDENCE_THRESHOLD:
-            print(f" -> Rejected due to low confidence ({confidence:.3f} < {CONFIDENCE_THRESHOLD})")
             continue
 
         obj["class_name"] = class_name
@@ -394,29 +391,99 @@ def draw_results(rectified_img, accepted_objects, total_ai_time):
     return output
 
 
-def print_objects(accepted_objects, total_ai_time):
-    print("\n" + "=" * 70)
-    print(f"Accepted target objects: {len(accepted_objects)}")
+def print_objects(frame_idx, accepted_objects, total_ai_time):
+    print(f"[frame {frame_idx}] objects={len(accepted_objects)} AI={total_ai_time * 1000:.0f} ms")
 
     for index, obj in enumerate(accepted_objects, start=1):
         x_mm, y_mm = obj["center_mm"]
         print(
-            f"Object {index}: {obj['class_name']} | "
+            f"  {index}: {obj['class_name']} | "
             f"confidence={obj['confidence']:.3f} | "
             f"X={x_mm:.1f} mm | Y={y_mm:.1f} mm | "
-            f"angle={obj['angle_deg']:.1f} deg | "
-            f"AI={obj['ai_time'] * 1000:.1f} ms"
+            f"angle={obj['angle_deg']:.1f} deg"
         )
 
-    print(f"Total AI inference time: {total_ai_time:.3f} s")
-
 
 # ============================================================
-# MAIN SINGLE-SHOT CAPTURE
+# MAIN STREAMING LOOP
 # ============================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Real-time A3 object detection from a Basler camera.")
+    parser.add_argument(
+        "--fps", type=float, default=MAX_FPS,
+        help=f"maximum frames processed per second, keeps the CPU cool (default: {MAX_FPS:g})",
+    )
+    parser.add_argument(
+        "--show", action="store_true",
+        help="show a live window (needs a display); ESC or q quits. Without it, quit with Ctrl+C",
+    )
+    args = parser.parse_args()
+    if args.fps <= 0:
+        parser.error("--fps must be greater than 0")
+    return args
+
+
+def open_camera(fps):
+    devices = find_devices()
+    if not devices:
+        raise RuntimeError("No Basler camera found.")
+
+    camera = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateFirstDevice())
+    camera.Open()
+
+    try:
+        camera.ExposureTime.SetValue(EXPOSURE_TIME)
+    except Exception as exc:
+        print(f"Could not set exposure time: {exc}")
+
+    # Ask the camera itself to produce no more than `fps` frames per second,
+    # so the USB/GigE link and the CPU are not busy with frames we throw away.
+    try:
+        camera.AcquisitionFrameRateEnable.SetValue(True)
+        camera.AcquisitionFrameRate.SetValue(fps)
+    except Exception as exc:
+        print(f"Could not limit camera frame rate (software limit still applies): {exc}")
+
+    return camera
+
+
+def process_frame(model, frame_bgr):
+    """Run the full pipeline on one frame. Returns (annotated_image, objects, ai_time)."""
+    corners = find_a3_corners(frame_bgr)
+    if corners is None:
+        annotated = frame_bgr.copy()
+        cv2.putText(
+            annotated, "A3 paper not found", (20, 45),
+            cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 0, 255), 3
+        )
+        return annotated, None, 0.0
+
+    rectified = rectify_a3(frame_bgr, corners)
+    candidates, _ = find_object_candidates(rectified)
+    accepted_objects, total_ai_time = classify_objects(model, rectified, candidates)
+    return draw_results(rectified, accepted_objects, total_ai_time), accepted_objects, total_ai_time
+
+
+def wait_until(deadline, show):
+    """Sleep until `deadline` (perf_counter time). Returns True if the user asked to quit."""
+    while True:
+        remaining = deadline - time.perf_counter()
+        if show:
+            key = cv2.waitKey(max(1, min(int(remaining * 1000), 50))) & 0xFF
+            if key in (27, ord("q")):
+                return True
+            if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+                return True
+        elif remaining > 0:
+            time.sleep(remaining)
+        if remaining <= 0:
+            return False
+
 
 def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    args = parse_args()
+    frame_period = 1.0 / args.fps
 
     if not MODEL_PATH.exists():
         print(f"Model not found: {MODEL_PATH.resolve()}")
@@ -425,83 +492,77 @@ def main():
     print(f"Loading model: {MODEL_PATH.resolve()}")
     model = YOLO(str(MODEL_PATH))
 
-    factory = pylon.TlFactory.GetInstance()
-    devices = find_devices()
-
-    if not devices:
-        print("No Basler camera found.")
-        return 1
-
     try:
-        camera = pylon.InstantCamera(factory.CreateFirstDevice())
-        camera.Open()
+        camera = open_camera(args.fps)
     except Exception as exc:
         print(f"Camera error: {exc}")
         return 1
-
-    try:
-        camera.ExposureTime.SetValue(EXPOSURE_TIME)
-    except Exception as exc:
-        print(f"Could not set exposure time: {exc}")
 
     converter = pylon.ImageFormatConverter()
     converter.OutputPixelFormat = pylon.PixelType_BGR8packed
     converter.OutputBitAlignment.Value = "MsbAligned"
 
-    print("Capturing frame from Basler camera...")
+    if args.show:
+        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+
+    print(f"Streaming at max {args.fps:g} fps. {'Press ESC or q' if args.show else 'Press Ctrl+C'} to quit.")
+
+    # LatestImageOnly drops old frames while we are busy, so we never fall behind.
+    camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+    frame_idx = 0
+    next_tick = time.perf_counter()
 
     try:
-        # Capture exactly ONE frame
-        grab_result = camera.GrabOne(5000, pylon.TimeoutHandling_ThrowException)
+        while camera.IsGrabbing():
+            try:
+                grab_result = camera.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
+            except pylon.TimeoutException:
+                print("Timed out waiting for a camera frame, retrying...")
+                continue
 
-        if not grab_result.GrabSucceeded():
-            print("Failed to grab frame from camera.")
-            return 1
+            try:
+                if not grab_result.GrabSucceeded():
+                    print(f"Grab failed: {grab_result.ErrorDescription}")
+                    continue
+                frame_bgr = converter.Convert(grab_result).GetArray()
+            finally:
+                grab_result.Release()
 
-        image = converter.Convert(grab_result)
-        frame_bgr = image.GetArray()
-        grab_result.Release()
+            frame_idx += 1
+            annotated, objects, ai_time = process_frame(model, frame_bgr)
 
-        # Save raw captured image
-        raw_path = OUTPUT_DIR / "raw_capture.png"
-        cv2.imwrite(str(raw_path), frame_bgr)
-        print(f"Saved raw image to: {raw_path}")
+            if objects is None:
+                print(f"[frame {frame_idx}] A3 paper not found")
+            else:
+                print_objects(frame_idx, objects, ai_time)
 
-        # 1. Find A3 paper
-        corners = find_a3_corners(frame_bgr)
+            if args.show:
+                cv2.imshow(WINDOW_NAME, annotated)
 
-        if corners is None:
-            print("A3 paper not found in capture.")
-            return 0
-
-        # 2. Rectify A3 paper
-        rectified = rectify_a3(frame_bgr, corners)
-
-        # 3. Find candidate shapes
-        candidates, object_mask = find_object_candidates(rectified)
-        cv2.imwrite(str(OUTPUT_DIR / "object_mask.png"), object_mask)
-
-        # 4. Classify objects
-        accepted_objects, total_ai_time = classify_objects(model, rectified, candidates)
-
-        # 5. Draw and save annotated output
-        output_img = draw_results(rectified, accepted_objects, total_ai_time)
-        result_path = OUTPUT_DIR / "detection_result.png"
-        cv2.imwrite(str(result_path), output_img)
-
-        # 6. Print terminal output
-        print_objects(accepted_objects, total_ai_time)
-        print(f"\nDetection image saved successfully to: {result_path}")
+            # Pace the loop: never start the next frame before the period has elapsed.
+            # If a frame took longer than the period, restart the clock instead of
+            # trying to catch up (catching up is what makes small devices overheat).
+            next_tick = max(next_tick + frame_period, time.perf_counter())
+            if wait_until(next_tick, args.show):
+                break
 
         return 0
 
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        return 0
+
     except Exception as exc:
-        print(f"An error occurred during detection: {exc}")
+        print(f"An error occurred: {exc}")
         return 1
 
     finally:
+        if camera.IsGrabbing():
+            camera.StopGrabbing()
         if camera.IsOpen():
             camera.Close()
+        if args.show:
+            cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
