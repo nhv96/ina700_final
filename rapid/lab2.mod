@@ -2,6 +2,9 @@ MODULE MainModule
     RECORD Mytargetpost
         num x;
         num y;
+        string shape;
+        num angle;
+        bool valid;
     ENDRECORD
     
 	TASK PERS tooldata sucker:=[TRUE,[[-82.5255,33.838,171.025],[1,0,0,0]],[1.1,[20,20,25],[1,0,0,0],0,0,0]];
@@ -37,9 +40,11 @@ MODULE MainModule
             IF StrLen(input) > 0 AND comma_pos <= StrLen(input) THEN
                 targetpost := processinput(input);
 
-                TPWrite "X: " + ValToStr(targetpost.x) + " Y: " + ValToStr(targetpost.y);
-                
-                pickandplace2(targetpost.x), (targetpost.y);
+                IF targetpost.valid THEN
+                    TPWrite "X: " + ValToStr(targetpost.x) + " Y: " + ValToStr(targetpost.y) + " Shape: " + targetpost.shape + " Angle: " + ValToStr(targetpost.angle);
+                    
+                    pickandplace2(targetpost.x), (targetpost.y);
+                ENDIF
             ENDIF
         ENDWHILE
         
@@ -48,35 +53,47 @@ MODULE MainModule
         ENDIF
 	ENDPROC
     
+    ! Parse "x,y,shape,angle" (e.g. "120.5,80.2,star,35.0"). result.valid is FALSE on any error.
     FUNC Mytargetpost processinput(string input)
         VAR Mytargetpost result;
-        VAR num x;
-        VAR num y;
-        VAR string x_str;
-        VAR string y_str;
+        VAR string fields{4};
+        VAR num start := 1;
         VAR num comma_pos;
         VAR bool ok;
         
-        comma_pos := StrFind(input, 1, ",");
+        result.valid := FALSE;
         
-        IF comma_pos <= StrLen(input) THEN
+        ! Split the input on commas into exactly 4 fields
+        FOR i FROM 1 TO 3 DO
+            comma_pos := StrFind(input, start, ",");
+            IF comma_pos > StrLen(input) THEN
+                TPWrite "Error: expected x,y,shape,angle but got: " + input;
+                RETURN result;
+            ENDIF
+            fields{i} := StrPart(input, start, comma_pos - start);
+            start := comma_pos + 1;
+        ENDFOR
+        fields{4} := StrPart(input, start, StrLen(input) - start + 1);
         
-            ! 2. Extract the X string (from index 1 up to the comma)
-            x_str := StrPart(input, 1, comma_pos - 1);
-            
-            ! 3. Extract the Y string (from right after the comma to the end)
-            y_str := StrPart(input, comma_pos + 1, StrLen(input) - comma_pos);
-    
-            ! 4. Convert both text strings into real numbers
-            ok := StrToVal(x_str, x);
-            ok := StrToVal(y_str, y);
-            
-            result.x := x;
-            result.y := y;
-        ELSE
-            TPWrite "Error: No comma found in the string.";
+        ! Convert the numeric fields; the shape stays as text
+        ok := StrToVal(fields{1}, result.x);
+        IF NOT ok THEN
+            TPWrite "Error: invalid x: " + fields{1};
+            RETURN result;
+        ENDIF
+        ok := StrToVal(fields{2}, result.y);
+        IF NOT ok THEN
+            TPWrite "Error: invalid y: " + fields{2};
+            RETURN result;
+        ENDIF
+        result.shape := fields{3};
+        ok := StrToVal(fields{4}, result.angle);
+        IF NOT ok THEN
+            TPWrite "Error: invalid angle: " + fields{4};
+            RETURN result;
         ENDIF
         
+        result.valid := TRUE;
         RETURN result;
     ENDFUNC
     
