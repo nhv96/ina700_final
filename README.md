@@ -1,3 +1,27 @@
+# Run with uv (recommended on the Raspberry Pi)
+
+uv installs the exact versions from `uv.lock`, including the CPU-only PyTorch, so the
+environment is about 1.5 GB (the default CUDA build is about 6 GB). It runs directly on the
+desktop, so the live window works.
+
+```bash
+# 1. Install uv (once)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 2. In the project folder: create .venv with Python 3.12 and install the locked packages
+uv sync --frozen
+
+# 3. Run with the live window (SPACE starts sending objects to the robot, ESC / q quits)
+uv run --frozen main.py --show
+```
+
+The Python version comes from `.python-version` (3.12). uv downloads it by itself if it is
+not installed, so the Pi's system Python 3.13 is left untouched.
+
+Without `--show` the program only detects objects and never sends anything to the robot.
+
+# Run with Docker (older way, no live window)
+
 Step to build:
 
 ## 1. Build ARM64 image on your PC

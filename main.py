@@ -2,6 +2,7 @@
 
 import argparse
 import shutil
+import threading
 import time
 from pathlib import Path
 
@@ -10,6 +11,8 @@ import numpy as np
 from pypylon import pylon
 from ultralytics import YOLO
 
+from http_server import ROBOT_HOST, ROBOT_PORT, RobotLink, parse_position
+
 # ============================================================
 # CONFIGURATION
 # ============================================================
@@ -17,7 +20,7 @@ from ultralytics import YOLO
 EXPOSURE_TIME = 25000.0
 
 # Upper limit on processed frames per second, to keep low-resource devices cool.
-MAX_FPS = 3.0
+MAX_FPS = 1.0
 WINDOW_NAME = "Detection (ESC / q to quit)"
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -405,6 +408,61 @@ def print_objects(frame_idx, accepted_objects, total_ai_time):
 
 
 # ============================================================
+# ROBOT COMMUNICATION
+# ============================================================
+
+class DoneAwareRobotLink(RobotLink):
+    """RobotLink that also remembers when the robot reports "DONE"."""
+
+    def __init__(self, host, port):
+        super().__init__(host, port)
+        self.done = threading.Event()
+
+    def _read_forever(self, client):
+        while True:
+            try:
+                data = client.recv(1024)
+            except OSError:
+                break
+            if not data:
+                break
+            text = data.decode("utf-8", errors="replace")
+            print(f"Received: {text}")
+            if "DONE" in text:
+                self.done.set()
+        with self._lock:
+            if self._client is client:
+                print("Robot closed the connection.")
+                self._close_client()
+
+
+def send_first_object(robot, objects):
+    """Send the first object of the list the robot accepts. Returns the sent object or None."""
+    for obj in objects:
+        x_mm, y_mm = obj["center_mm"]
+        try:
+            message = parse_position(
+                {"x": x_mm, "y": y_mm, "shape": obj["class_name"], "angle": obj["angle_deg"]}
+            )
+        except ValueError as exc:
+            print(f"Skipping {obj['class_name']}: {exc}")
+            continue
+
+        robot.done.clear()
+        if robot.send(message):
+            return obj
+        return None
+    return None
+
+
+def draw_banner(img, text, color):
+    cv2.putText(
+        img, text, (20, 85),
+        cv2.FONT_HERSHEY_SIMPLEX, 1.1, color, 3
+    )
+
+
+# ============================================================
 # MAIN STREAMING LOOP
 # ============================================================
 
@@ -416,7 +474,16 @@ def parse_args():
     )
     parser.add_argument(
         "--show", action="store_true",
-        help="show a live window (needs a display); ESC or q quits. Without it, quit with Ctrl+C",
+        help="show a live window (needs a display); ESC or q quits. Without it, quit with Ctrl+C. "
+             "Required to send objects to the robot (SPACE confirms the start)",
+    )
+    parser.add_argument(
+        "--robot-host", default=ROBOT_HOST,
+        help=f"IP to listen on for the robot (default: {ROBOT_HOST})",
+    )
+    parser.add_argument(
+        "--robot-port", type=int, default=ROBOT_PORT,
+        help=f"TCP port for the robot (default: {ROBOT_PORT})",
     )
     args = parser.parse_args()
     if args.fps <= 0:
@@ -466,19 +533,38 @@ def process_frame(model, frame_bgr):
 
 
 def wait_until(deadline, show):
-    """Sleep until `deadline` (perf_counter time). Returns True if the user asked to quit."""
+    """Sleep until `deadline` (perf_counter time).
+
+    Returns "quit" if the user asked to quit, "space" if SPACE was pressed, else None.
+    """
     while True:
         remaining = deadline - time.perf_counter()
         if show:
             key = cv2.waitKey(max(1, min(int(remaining * 1000), 50))) & 0xFF
             if key in (27, ord("q")):
-                return True
+                return "quit"
+            if key == ord(" "):
+                return "space"
             if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
-                return True
+                return "quit"
         elif remaining > 0:
             time.sleep(remaining)
         if remaining <= 0:
-            return False
+            return None
+
+
+def wait_for_done(robot):
+    """Block until the robot reports DONE, keeping the window alive.
+
+    Returns "done", "quit" or "disconnected".
+    """
+    while not robot.done.wait(0.05):
+        key = cv2.waitKey(1) & 0xFF
+        if key in (27, ord("q")) or cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+            return "quit"
+        if not robot.connected:
+            return "disconnected"
+    return "done"
 
 
 def main():
@@ -492,10 +578,23 @@ def main():
     print(f"Loading model: {MODEL_PATH.resolve()}")
     model = YOLO(str(MODEL_PATH))
 
+    robot = None
+    if args.show:
+        try:
+            robot = DoneAwareRobotLink(args.robot_host, args.robot_port)
+        except OSError as exc:
+            print(f"Cannot open robot socket on {args.robot_host}:{args.robot_port}: {exc}")
+            return 1
+        threading.Thread(target=robot.accept_forever, daemon=True).start()
+    else:
+        print("Running without --show: objects are only detected, nothing is sent to the robot.")
+
     try:
         camera = open_camera(args.fps)
     except Exception as exc:
         print(f"Camera error: {exc}")
+        if robot is not None:
+            robot.close()
         return 1
 
     converter = pylon.ImageFormatConverter()
@@ -511,6 +610,7 @@ def main():
     camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
     frame_idx = 0
     next_tick = time.perf_counter()
+    armed = False  # True after the operator pressed SPACE: objects are being sent to the robot
 
     try:
         while camera.IsGrabbing():
@@ -536,6 +636,42 @@ def main():
             else:
                 print_objects(frame_idx, objects, ai_time)
 
+            found = bool(objects)
+
+            if armed:
+                if not found:
+                    print("No more objects found. Sending stopped.")
+                    armed = False
+                elif (sent := send_first_object(robot, objects)) is None:
+                    print("Could not send to the robot (not connected?). Sending stopped.")
+                    armed = False
+                else:
+                    draw_banner(annotated, f"Sent {sent['class_name']}, waiting for DONE...", (0, 140, 255))
+                    cv2.imshow(WINDOW_NAME, annotated)
+                    cv2.waitKey(1)
+
+                    # Pause the camera while the robot works: no stale frames afterwards.
+                    camera.StopGrabbing()
+                    result = wait_for_done(robot)
+                    if result == "quit":
+                        break
+                    if result == "disconnected":
+                        print("Robot disconnected while waiting for DONE. Sending stopped.")
+                        armed = False
+                    else:
+                        print("Robot reported DONE.")
+                    camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+                    next_tick = time.perf_counter()
+                    continue
+
+            if robot is not None and not armed and found:
+                if robot.connected:
+                    draw_banner(
+                        annotated, f"{len(objects)} object(s) found. Press SPACE to send to robot", (0, 160, 0)
+                    )
+                else:
+                    draw_banner(annotated, "Objects found, but robot is not connected", (0, 0, 255))
+
             if args.show:
                 cv2.imshow(WINDOW_NAME, annotated)
 
@@ -543,8 +679,12 @@ def main():
             # If a frame took longer than the period, restart the clock instead of
             # trying to catch up (catching up is what makes small devices overheat).
             next_tick = max(next_tick + frame_period, time.perf_counter())
-            if wait_until(next_tick, args.show):
+            event = wait_until(next_tick, args.show)
+            if event == "quit":
                 break
+            if event == "space" and not armed and found and robot.connected:
+                armed = True
+                print("Sending to robot started.")
 
         return 0
 
@@ -563,6 +703,9 @@ def main():
             camera.Close()
         if args.show:
             cv2.destroyAllWindows()
+        if robot is not None:
+            robot.close()
+            print("Sockets closed.")
 
 
 if __name__ == "__main__":
