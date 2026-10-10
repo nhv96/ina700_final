@@ -44,6 +44,9 @@ MODULE MainModule
                     TPWrite "X: " + ValToStr(targetpost.x) + " Y: " + ValToStr(targetpost.y) + " Shape: " + targetpost.shape + " Angle: " + ValToStr(targetpost.angle);
                     
                     pickandplace2 targetpost.x, targetpost.y, targetpost.shape, targetpost.angle;
+                    
+                    ! Tell the Raspberry the pick and place is finished
+                    RobotClienSendMessage "DONE";
                 ENDIF
             ENDIF
         ENDWHILE

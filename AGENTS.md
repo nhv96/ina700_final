@@ -10,7 +10,7 @@ This project is intended to run on a Raspberry Pi device that running Ubuntu OS 
 So the goal is the project must be small and lightweight.
 
 The Raspberry will run the program to detect objects and their positions (x,y,shape,angle), and send this information over
-TCP socket connection to ABB robot for it to move to that position and pick up the object.
+TCP socket connection (file `http_server.py`) to ABB robot for it to move to that position and pick up the object.
 
 The RAPID code of ABB robot is stored in the folder `rapid`.
 
