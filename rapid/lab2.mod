@@ -43,7 +43,7 @@ MODULE MainModule
                 IF targetpost.valid THEN
                     TPWrite "X: " + ValToStr(targetpost.x) + " Y: " + ValToStr(targetpost.y) + " Shape: " + targetpost.shape + " Angle: " + ValToStr(targetpost.angle);
                     
-                    pickandplace2(targetpost.x), (targetpost.y);
+                    pickandplace2 targetpost.x, targetpost.y, targetpost.shape, targetpost.angle;
                 ENDIF
             ENDIF
         ENDWHILE
@@ -124,26 +124,44 @@ MODULE MainModule
 		MoveL PHOME, v1000, fine, sucker\WObj:=wobj0;
 	ENDPROC
     
-    PROC pickandplace2(num x, num y)
+    ! Pick the object at (x, y) in wobj1, rotated about the wobj Z axis by angle (degrees),
+    ! then place it at the predefined position of its shape in wobj2.
+    PROC pickandplace2(num x, num y, string shape, num angle)
         VAR robtarget target := [[800.03,-177.70,813.24],[0.0162618,-0.228551,-0.973383,-0.00511577],[-1,0,0,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
-		target.trans.x := x;
+        VAR robtarget placetarget;
+
+        IF shape = "hexagon" THEN
+            placetarget := PHEXAGON;
+        ELSEIF shape = "star" THEN
+            placetarget := PSTAR;
+        ELSEIF shape = "square" THEN
+            placetarget := PSQUARE;
+        ELSEIF shape = "triangle" THEN
+            placetarget := PTRIANGLE;
+        ELSE
+            TPWrite "Error: unknown shape: " + shape;
+            RETURN;
+        ENDIF
+
+        target.trans.x := x;
         target.trans.y := y;
         target.trans.z := 2.84;
+        ! Rotate the tool about the Z axis of the work object (pre-multiply)
+        target.rot := OrientZYX(angle, 0, 0) * target.rot;
 
-		MoveL PHOME, v1000, fine, sucker\WObj:=wobj0;
-		MoveL PAPPROAC, v1000, fine, sucker\WObj:=wobj1;
-		MoveL target, v1000, fine, sucker\WObj:=wobj1;
+        MoveL PHOME, v1000, fine, sucker\WObj:=wobj0;
+        MoveL PAPPROAC, v1000, fine, sucker\WObj:=wobj1;
+        MoveL target, v1000, fine, sucker\WObj:=wobj1;
         SetDO doValet2, 1;
         WaitTime 0.5;
-		MoveL PAPPROAC, v1000, fine, sucker\WObj:=wobj1;
-        
-        
-		MoveL PAPPROAC, v1000, fine, sucker\WObj:=wobj2;
-		MoveL target, v1000, fine, sucker\WObj:=wobj2;
+        MoveL PAPPROAC, v1000, fine, sucker\WObj:=wobj1;
+
+        MoveL PAPPROAC, v1000, fine, sucker\WObj:=wobj2;
+        MoveL placetarget, v1000, fine, sucker\WObj:=wobj2;
         SetDO doValet2, 0;
         WaitTime 0.5;
-        
-		MoveL PAPPROAC, v1000, fine, sucker\WObj:=wobj2;
-		MoveL PHOME, v1000, fine, sucker\WObj:=wobj0;
-	ENDPROC
+
+        MoveL PAPPROAC, v1000, fine, sucker\WObj:=wobj2;
+        MoveL PHOME, v1000, fine, sucker\WObj:=wobj0;
+    ENDPROC
 ENDMODULE
