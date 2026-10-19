@@ -39,6 +39,13 @@ WORK_MARGIN_MM = 5.0
 CONFIDENCE_THRESHOLD = 0.9
 REJECT_CLASS = "other"
 
+# Extra turn (deg) added to hexagons if they still sit slightly off in the tray.
+HEXAGON_ANGLE_OFFSET_DEG = 0.0
+
+# Direction (deg, same frame as hexagon_rotation_deg) of one tip of the star in the tray.
+# The tray star's top tip is ~5 deg off the X axis. If stars end up 10 deg off, flip the sign.
+STAR_TRAY_TIP_DEG = 0.0
+
 
 # ============================================================
 # BASLER CAMERA
@@ -254,6 +261,67 @@ def normalize_box_angle(rect):
     return angle % 180.0
 
 
+def outline_direction_deg(contour, fold):
+    """Direction (deg, in the robot X/Y frame) of the object's far points, modulo 360/fold.
+
+    minAreaRect cannot be used for round-ish shapes: a hexagon or a star fits almost the
+    same box at many angles, so its angle jumps between frames. Instead use the `fold`-th
+    harmonic of the outline distance from the centre, which repeats every 360/fold deg
+    just like the shape does.
+    """
+    pts = cv2.convexHull(contour).reshape(-1, 2).astype(np.float64)
+    nxt = np.roll(pts, -1, axis=0)
+    seg = np.linalg.norm(nxt - pts, axis=1)
+
+    # Evenly spaced points along the outline, so long edges do not outweigh short ones.
+    cum = np.concatenate(([0.0], np.cumsum(seg)))
+    t = np.linspace(0.0, cum[-1], 720, endpoint=False)
+    idx = np.searchsorted(cum, t, side="right") - 1
+    outline = pts[idx] + ((t - cum[idx]) / seg[idx])[:, None] * (nxt[idx] - pts[idx])
+
+    m = cv2.moments(contour)
+    cx, cy = m["m10"] / m["m00"], m["m01"] / m["m00"]
+
+    # Robot frame: X = image row direction, Y = image column direction (see "Swapped coordinates").
+    vx = outline[:, 1] - cy
+    vy = outline[:, 0] - cx
+    phi = np.arctan2(vy, vx)
+    radius = np.hypot(vx, vy)
+
+    return np.degrees(np.angle(np.sum(radius * np.exp(1j * fold * phi)))) / fold
+
+
+def wrap_deg(angle, period):
+    """Wrap `angle` into [-period/2, period/2)."""
+    return (angle + period / 2.0) % period - period / 2.0
+
+
+def hexagon_rotation_deg(contour):
+    """Shortest turn (-30..30 deg) that makes a hexagon's edges parallel to the robot X axis.
+
+    For a regular hexagon "corner direction" and "edge direction" are equal modulo 60 deg.
+    """
+    corner_deg = outline_direction_deg(contour, 6)
+    return wrap_deg(corner_deg + HEXAGON_ANGLE_OFFSET_DEG, 60.0)
+
+
+def star_rotation_deg(contour):
+    """Shortest turn (-36..36 deg) that points a 5-point star's tip like the tray's star."""
+    tip_deg = outline_direction_deg(contour, 5)
+    return wrap_deg(tip_deg - STAR_TRAY_TIP_DEG, 72.0)
+
+
+def robot_angle_deg(obj):
+    """Angle the robot must rotate the tool about Z, depending on the detected shape."""
+    if obj["class_name"].strip().lower() == "hexagon":
+        return hexagon_rotation_deg(obj["contour"])
+    if obj["class_name"].strip().lower() == "star":
+        return star_rotation_deg(obj["contour"])
+    if obj["class_name"].strip().lower() == "circle":
+        return 0.0
+    return obj["angle_deg"]
+
+
 def find_object_candidates(rectified_img):
     object_mask = create_object_mask(rectified_img)
     contours, _ = cv2.findContours(object_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -348,6 +416,7 @@ def classify_objects(model, rectified_img, candidates):
         obj["class_name"] = class_name
         obj["confidence"] = confidence
         obj["ai_time"] = ai_time
+        obj["robot_angle_deg"] = robot_angle_deg(obj)
         accepted_objects.append(obj)
 
     return accepted_objects, total_ai_time
@@ -371,7 +440,7 @@ def draw_results(rectified_img, accepted_objects, total_ai_time):
         cv2.circle(output, (int(round(cx)), int(round(cy))), 7, (0, 0, 255), -1)
 
         label1 = f"{obj['class_name']} {obj['confidence']:.2f}"
-        label2 = f"X={x_mm:.1f} mm Y={y_mm:.1f} mm A={obj['angle_deg']:.1f} deg"
+        label2 = f"X={x_mm:.1f} mm Y={y_mm:.1f} mm A={obj['robot_angle_deg']:.1f} deg"
 
         text_x = max(5, int(round(cx)) - 110)
         text_y = max(25, int(round(cy)) - 40)
@@ -403,7 +472,7 @@ def print_objects(frame_idx, accepted_objects, total_ai_time):
             f"  {index}: {obj['class_name']} | "
             f"confidence={obj['confidence']:.3f} | "
             f"X={x_mm:.1f} mm | Y={y_mm:.1f} mm | "
-            f"angle={obj['angle_deg']:.1f} deg"
+            f"angle={obj['robot_angle_deg']:.1f} deg"
         )
 
 
@@ -442,7 +511,7 @@ def send_first_object(robot, objects):
         x_mm, y_mm = obj["center_mm"]
         try:
             message = parse_position(
-                {"x": x_mm, "y": y_mm, "shape": obj["class_name"], "angle": obj["angle_deg"]}
+                {"x": x_mm, "y": y_mm, "shape": obj["class_name"], "angle": obj["robot_angle_deg"]}
             )
         except ValueError as exc:
             print(f"Skipping {obj['class_name']}: {exc}")

@@ -26,7 +26,7 @@ API_HOST = "0.0.0.0"
 API_PORT = 8000
 
 # Must match the shape names understood by pickandplace2 in rapid/lab2.mod
-SHAPES = {"hexagon", "star", "square", "triangle"}
+SHAPES = {"circle", "hexagon", "star", "square", "triangle"}
 MAX_BODY_BYTES = 1024
 
 
