@@ -7,15 +7,16 @@ MODULE MainModule
         bool valid;
     ENDRECORD
     
-	TASK PERS tooldata sucker:=[TRUE,[[-82.5255,33.838,171.025],[1,0,0,0]],[1.1,[20,20,25],[1,0,0,0],0,0,0]];
-	TASK PERS wobjdata wobj1:=[FALSE,TRUE,"",[[844.518,-343.337,481.049],[0.999981,0.00119971,0.00155025,0.00576057]],[[0,0,0],[1,0,0,0]]];
-	TASK PERS wobjdata wobj2:=[FALSE,TRUE,"",[[763.38,162.742,490.713],[0.99949,0.00316899,-0.0026938,0.0316706]],[[0,0,0],[1,0,0,0]]];
+	TASK PERS tooldata sucker:=[TRUE,[[-82.4696,35.0497,184.91],[1,0,0,0]],[1.1,[0,20,25],[1,0,0,0],0,0,0]];
+	TASK PERS wobjdata wobj1:=[FALSE,TRUE,"",[[885.774,-364.412,482.301],[0.998222,-0.00339004,0.00508054,0.0592851]],[[0,0,0],[1,0,0,0]]];
+	TASK PERS wobjdata wobj2:=[FALSE,TRUE,"",[[775.223,233.316,494.891],[0.988934,-0.0140034,0.0106169,-0.14731]],[[0,0,0],[1,0,0,0]]];
 	CONST robtarget PHOME:=[[800.03,-177.70,813.24],[0.0162618,-0.228551,-0.973383,-0.00511577],[-1,0,0,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
 	CONST robtarget PHEXAGON:=[[47.38,40.47,4.69],[0.0130504,-0.203534,-0.97898,-0.00153884],[-1,0,0,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
-	CONST robtarget PSTAR:=[[109.17,88.68,3.04],[0.0130595,-0.203509,-0.978985,-0.00153651],[-1,0,0,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
+	CONST robtarget PSTAR:=[[106.78,94.22,6.20],[0.0117388,0.453195,-0.891304,-0.00729179],[0,-1,-1,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
 	CONST robtarget PTRIANGLE:=[[161.16,26.93,3.92],[0.0130766,-0.203477,-0.978991,-0.00154229],[-1,0,0,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
 	CONST robtarget PSQUARE:=[[170.49,144.42,2.84],[0.0130853,-0.203484,-0.97899,-0.00155356],[-1,0,0,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
 	CONST robtarget PAPPROAC:=[[111.28,94.22,200.93],[0.0130856,-0.203488,-0.978989,-0.00154192],[-1,0,0,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
+	CONST robtarget PCIRCLE:=[[39.02,148.59,3.85],[0.0109833,0.260284,-0.965442,-0.00727328],[0,0,0,0],[9E+09,9E+09,9E+09,9E+09,9E+09,9E+09]];
 	
     ! Input from the Rasp must be in this format: x,y,shape,angle
     
@@ -100,33 +101,6 @@ MODULE MainModule
         RETURN result;
     ENDFUNC
     
-	PROC pickandplace(num shape)
-        VAR robtarget target := [[0,0,0],[1,0,0,0],[0,0,0,0],[9E9,9E9,9E9,9E9,9E9,9E9]];
-		IF shape=1 THEN
-			target := PHEXAGON;
-        ELSEIF shape=2 THEN
-            target := PSTAR;
-        ELSEIF shape=3 THEN
-            target := PSQUARE;
-        ELSEIF shape=4 THEN
-            target := PTRIANGLE;
-		ENDIF
-		MoveL PHOME, v1000, fine, sucker\WObj:=wobj0;
-		MoveL PAPPROAC, v1000, fine, sucker\WObj:=wobj1;
-		MoveL target, v1000, fine, sucker\WObj:=wobj1;
-        SetDO doValet2, 1;
-        WaitTime 0.5;
-        
-		MoveL PAPPROAC, v1000, fine, sucker\WObj:=wobj1;
-		MoveL PAPPROAC, v1000, fine, sucker\WObj:=wobj2;
-		MoveL target, v1000, fine, sucker\WObj:=wobj2;
-        SetDO doValet2, 0;
-        WaitTime 0.5;
-        
-		MoveL PAPPROAC, v1000, fine, sucker\WObj:=wobj2;
-		MoveL PHOME, v1000, fine, sucker\WObj:=wobj0;
-	ENDPROC
-    
     ! Pick the object at (x, y) in wobj1, rotated about the wobj Z axis by angle (degrees),
     ! then place it at the predefined position of its shape in wobj2.
     PROC pickandplace2(num x, num y, string shape, num angle)
@@ -141,6 +115,8 @@ MODULE MainModule
             placetarget := PSQUARE;
         ELSEIF shape = "triangle" THEN
             placetarget := PTRIANGLE;
+        ELSEIF shape = "circle" THEN
+            placetarget := PCIRCLE;
         ELSE
             TPWrite "Error: unknown shape: " + shape;
             RETURN;
@@ -148,7 +124,7 @@ MODULE MainModule
 
         target.trans.x := x;
         target.trans.y := y;
-        target.trans.z := 2.84;
+        target.trans.z := 1.5;
         ! Rotate the tool about the Z axis of the work object (pre-multiply)
         target.rot := OrientZYX(angle, 0, 0) * target.rot;
 
